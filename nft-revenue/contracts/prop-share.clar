@@ -1,7 +1,15 @@
-;; Revenue-Generating NFT Fractionalization
-;; Handles NFT deposits, share management, and revenue distribution
+;; Define NFT trait (SIP-009)
+(define-trait nft-trait
+    (
+        (transfer (uint principal principal) (response bool uint))
+        (get-owner (uint) (response principal uint))
+        (get-token-uri (uint) (response (optional (string-utf8 256)) uint))
+        (get-last-token-id () (response uint uint))
+    )
+)
 
-;; Constants
+;; Constants 
+(define-data-var contract-nft principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.nft-contract)
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-INVALID-VAULT (err u101))
@@ -51,16 +59,25 @@
     (is-eq tx-sender CONTRACT-OWNER)
 )
 
+;; Set NFT contract address - only contract owner can do this
+(define-public (set-nft-contract (new-contract principal))
+    (begin
+        (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (ok (var-set contract-nft new-contract))
+    )
+)
+
 ;; Initialize new vault with NFT deposit
-(define-public (create-vault (nft-id uint))
+(define-public (create-vault (token-contract <nft-trait>) (nft-id uint))
     (let
         (
             (vault-id (var-get next-vault-id))
             (sender tx-sender)
+            (current-height block-height)
         )
         ;; Transfer NFT to vault
-        (try! (contract-call? .nft-contract transfer nft-id sender (as-contract tx-sender)))
-        
+        (try! (contract-call? token-contract transfer nft-id sender (as-contract tx-sender)))
+
         ;; Create new vault
         (map-set vaults
             { vault-id: vault-id }
@@ -69,7 +86,7 @@
                 nft-id: nft-id,
                 total-shares: SHARES-PER-NFT,
                 accumulated-revenue: u0,
-                last-distribution: (get-block-height),
+                last-distribution: current-height,
                 revenue-per-share: u0,
                 is-active: true
             }
@@ -80,7 +97,7 @@
             { vault-id: vault-id, holder: sender }
             { 
                 shares: SHARES-PER-NFT,
-                last-claim: (get-block-height)
+                last-claim: current-height
             }
         )
         
@@ -98,6 +115,7 @@
             (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-INVALID-VAULT))
             (sender-holding (unwrap! (map-get? share-holdings 
                 { vault-id: vault-id, holder: sender }) ERR-INSUFFICIENT-SHARES))
+            (current-height block-height)
         )
         ;; Verify vault is active
         (asserts! (get is-active vault) ERR-INACTIVE-VAULT)
@@ -112,7 +130,7 @@
             { vault-id: vault-id, holder: sender }
             { 
                 shares: (- (get shares sender-holding) amount),
-                last-claim: (get-block-height)
+                last-claim: current-height
             }
         )
         
@@ -120,14 +138,14 @@
         (let
             (
                 (recipient-holding (default-to 
-                    { shares: u0, last-claim: (get-block-height) }
+                    { shares: u0, last-claim: current-height }
                     (map-get? share-holdings { vault-id: vault-id, holder: recipient })))
             )
             (map-set share-holdings
                 { vault-id: vault-id, holder: recipient }
                 { 
                     shares: (+ (get shares recipient-holding) amount),
-                    last-claim: (get-block-height)
+                    last-claim: current-height
                 }
             )
             (ok true)
@@ -140,7 +158,8 @@
     (let
         (
             (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-INVALID-VAULT))
-            (current-period (- (get-block-height) (get last-distribution vault)))
+            (current-height block-height)
+            (current-period (- current-height (get last-distribution vault)))
         )
         ;; Only contract owner can add revenue
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
@@ -163,7 +182,7 @@
                     nft-id: (get nft-id vault),
                     total-shares: (get total-shares vault),
                     accumulated-revenue: (+ (get accumulated-revenue vault) amount),
-                    last-distribution: (get-block-height),
+                    last-distribution: current-height,
                     revenue-per-share: new-revenue-per-share,
                     is-active: (get is-active vault)
                 }
@@ -174,7 +193,7 @@
                 { vault-id: vault-id, period: current-period }
                 {
                     amount: amount,
-                    timestamp: (get-block-height),
+                    timestamp: current-height,
                     revenue-type: revenue-type
                 }
             )
@@ -185,62 +204,66 @@
 
 ;; Calculate unclaimed dividends
 (define-private (calculate-unclaimed-revenue (vault-id uint) (holder principal))
-    (let
-        (
-            (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-INVALID-VAULT))
-            (holder-info (unwrap! (map-get? share-holdings 
-                { vault-id: vault-id, holder: holder }) ERR-NO-DIVIDENDS))
-        )
-        (/ (* (get shares holder-info)
-            (- (get revenue-per-share vault)
-               (get last-claim holder-info))) 
-           u1000000)
-    )
+    (match (map-get? vaults { vault-id: vault-id })
+        vault (match (map-get? share-holdings { vault-id: vault-id, holder: holder })
+            holder-info (ok (/ (* (get shares holder-info)
+                                (- (get revenue-per-share vault)
+                                   (get last-claim holder-info)))
+                             u1000000))
+            ERR-NO-DIVIDENDS)
+        ERR-INVALID-VAULT)
 )
 
 ;; Claim available dividends
 (define-public (claim-dividends (vault-id uint))
     (let
         (
-            (unclaimed-amount (calculate-unclaimed-revenue vault-id tx-sender))
+            (unclaimed-result (calculate-unclaimed-revenue vault-id tx-sender))
         )
         ;; Verify there are dividends to claim
-        (asserts! (> unclaimed-amount u0) ERR-NO-DIVIDENDS)
-        
-        ;; Update last claim timestamp
-        (map-set share-holdings
-            { vault-id: vault-id, holder: tx-sender }
-            {
-                shares: (get shares (unwrap! (map-get? share-holdings 
-                    { vault-id: vault-id, holder: tx-sender }) ERR-NO-DIVIDENDS)),
-                last-claim: (get revenue-per-share 
-                    (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-INVALID-VAULT))
-            }
+        (asserts! (is-ok unclaimed-result) ERR-NO-DIVIDENDS)
+        (let
+            (
+                (unclaimed-amount (unwrap! unclaimed-result ERR-NO-DIVIDENDS))
+                (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-INVALID-VAULT))
+            )
+            ;; Verify amount is greater than zero
+            (asserts! (> unclaimed-amount u0) ERR-NO-DIVIDENDS)
+            
+            ;; Update last claim timestamp
+            (map-set share-holdings
+                { vault-id: vault-id, holder: tx-sender }
+                {
+                    shares: (get shares (unwrap! (map-get? share-holdings 
+                        { vault-id: vault-id, holder: tx-sender }) ERR-NO-DIVIDENDS)),
+                    last-claim: (get revenue-per-share vault)
+                }
+            )
+            
+            ;; Transfer dividends
+            (as-contract (stx-transfer? unclaimed-amount (as-contract tx-sender) tx-sender))
         )
-        
-        ;; Transfer dividends
-        (as-contract (stx-transfer? unclaimed-amount (as-contract tx-sender) tx-sender))
     )
 )
 
 ;; Buyout the entire NFT
-(define-public (buyout-nft (vault-id uint))
+(define-public (buyout-nft (token-contract <nft-trait>) (vault-id uint))
     (let
         (
             (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-INVALID-VAULT))
             (buyer-shares (unwrap! (map-get? share-holdings 
                 { vault-id: vault-id, holder: tx-sender }) ERR-INSUFFICIENT-SHARES))
         )
-        ;; Verify buyer has all shares
-        (asserts! (is-eq (get shares buyer-shares) SHARES-PER-NFT) ERR-INSUFFICIENT-SHARES)
         ;; Verify vault is active
         (asserts! (get is-active vault) ERR-INACTIVE-VAULT)
+        ;; Verify buyer owns all shares
+        (asserts! (is-eq (get shares buyer-shares) SHARES-PER-NFT) ERR-INSUFFICIENT-SHARES)
         
         ;; Process any remaining dividends
         (try! (claim-dividends vault-id))
         
         ;; Transfer NFT to buyer
-        (try! (as-contract (contract-call? .nft-contract transfer
+        (try! (as-contract (contract-call? token-contract transfer
             (get nft-id vault)
             (as-contract tx-sender)
             tx-sender)))
@@ -253,11 +276,12 @@
                 nft-id: (get nft-id vault),
                 total-shares: u0,
                 accumulated-revenue: (get accumulated-revenue vault),
-                last-distribution: (get-block-height),
+                last-distribution: (get last-distribution vault),
                 revenue-per-share: (get revenue-per-share vault),
                 is-active: false
             }
         )
+        
         (ok true)
     )
 )
@@ -272,9 +296,13 @@
 )
 
 (define-read-only (get-unclaimed-dividends (vault-id uint) (holder principal))
-    (ok (calculate-unclaimed-revenue vault-id holder))
+    (calculate-unclaimed-revenue vault-id holder)
 )
 
 (define-read-only (get-revenue-period (vault-id uint) (period uint))
     (map-get? revenue-periods { vault-id: vault-id, period: period })
+)
+
+(define-read-only (get-nft-contract)
+    (ok (var-get contract-nft))
 )

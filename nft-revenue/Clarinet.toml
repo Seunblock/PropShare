@@ -5,8 +5,18 @@ authors = []
 telemetry = true
 cache_dir = '.\.cache'
 requirements = []
+[contracts.nft-trait]
+path = 'contracts/nft-trait.clar'
+clarity_version = 2
+epoch = 2.5
+
 [contracts.prop-share]
 path = 'contracts/prop-share.clar'
+clarity_version = 2
+epoch = 2.5
+
+[contracts.test-nft]
+path = 'contracts/test-nft.clar'
 clarity_version = 2
 epoch = 2.5
 [repl.analysis]
